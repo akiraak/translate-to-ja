@@ -17,6 +17,9 @@
     "url": "https://github.com/akiraak/translate-to-ja/issues"
   },
   "homepage": "https://github.com/akiraak/translate-to-ja#readme",
+  "bin": {
+    "translate_to_ja": "./translate_to_ja.mjs"
+  },
   "dependencies": {
     "@langchain/core": "^1.1.4",
     "@langchain/openai": "^1.1.3",
