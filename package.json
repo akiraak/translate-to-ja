@@ -1,0 +1,26 @@
+{
+  "name": "translate-to-ja",
+  "version": "1.0.0",
+  "description": "テキストを日本語に翻訳する",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akiraak/translate-to-ja.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/akiraak/translate-to-ja/issues"
+  },
+  "homepage": "https://github.com/akiraak/translate-to-ja#readme",
+  "dependencies": {
+    "@langchain/core": "^1.1.4",
+    "@langchain/openai": "^1.1.3",
+    "@langchain/textsplitters": "^1.0.1",
+    "dotenv": "^17.2.3"
+  }
+}
