@@ -27,14 +27,14 @@ Output ONLY the translated Japanese text.
   // --- 引数解析 ---
   const args = process.argv.slice(2);
   
-  // --out または -o の後の値を取得
-  const outIndex = args.findIndex(arg => arg === '--out' || arg === '-o');
+  // 修正箇所: --debug-dir または -d を検知するように変更
+  const debugIndex = args.findIndex(arg => arg === '--debug-dir' || arg === '-d');
   let debugDir = null;
   
-  if (outIndex !== -1 && args[outIndex + 1]) {
-    debugDir = args[outIndex + 1];
-    // 引数リストから --out 関連を除去（残りをテキストとみなすため）
-    args.splice(outIndex, 2);
+  if (debugIndex !== -1 && args[debugIndex + 1]) {
+    debugDir = args[debugIndex + 1];
+    // 引数リストからフラグとパスを除去（残りをテキスト入力とみなすため）
+    args.splice(debugIndex, 2);
   }
 
   // --- 入力テキストの取得 (Stdin or Args) ---
@@ -52,13 +52,14 @@ Output ONLY the translated Japanese text.
 
   try {
     // --- デバッグ: ディレクトリ作成 ---
-    if (debugDir && !fs.existsSync(debugDir)) {
-      fs.mkdirSync(debugDir, { recursive: true });
-    }
-
-    // --- デバッグ: 入力テキスト保存 ---
     if (debugDir) {
+      if (!fs.existsSync(debugDir)) {
+        fs.mkdirSync(debugDir, { recursive: true });
+      }
+
+      // 1. 原文の保存
       fs.writeFileSync(path.join(debugDir, '01_input_text.txt'), inputText);
+      // 2. システムプロンプトの保存
       fs.writeFileSync(path.join(debugDir, '02_system_prompt.txt'), CONFIG.SYSTEM_PROMPT);
     }
 
@@ -75,9 +76,10 @@ Output ONLY the translated Japanese text.
 
     // --- デバッグ: 結果保存 ---
     if (debugDir) {
+      // 3. 翻訳結果の保存
       fs.writeFileSync(path.join(debugDir, '03_output_text.txt'), translatedText);
       
-      // メタデータ（トークン使用量など）も保存しておくと便利
+      // 4. メタデータの保存
       const metaData = {
         model: completion.model,
         usage: completion.usage,
