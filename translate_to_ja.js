@@ -6,16 +6,41 @@ const fs = require('fs');
 const path = require('path');
 
 // ==========================================
-// 設定
+// 設定 (Configuration)
 // ==========================================
 const CONFIG = {
-  MODEL: 'gpt-5',
-  SYSTEM_PROMPT: `
-You are a professional translator. 
-Translate the following text into natural, fluent Japanese.
-Maintain the tone and nuance of the original text.
-Output ONLY the translated Japanese text.
-`.trim(),
+  MODEL: 'gpt-4o', 
+  TEMPERATURE: 0,
+};
+
+// ==========================================
+// プロンプト定義
+// ==========================================
+const PROMPTS = {
+  DRAFT_SYSTEM: `You are a professional technical translator.
+Translate the input text into Japanese strictly adhering to the following [Constraints].
+
+[Constraints]
+1. **Output Language**: Always output in Japanese.
+2. **Keep English Terms**: Do not katakana-ize product names, codes, specific proper nouns, or technical terms (e.g., 'iPhone', 'Python', 'API') if the original English spelling is more natural for pronunciation or recognition. Keep them in English.
+3. **Maintain Existing Japanese**: If parts of the input text are already in natural Japanese, keep them exactly as they are.
+4. **TTS Optimization**: Translate for Text-To-Speech (TTS) purposes. Ensure the Japanese is audibly easy to understand with a natural rhythm. Break up sentences that are too long.
+5. **No Superfluous Text**: Do not include explanations, notes, or conversational fillers. Output ONLY the translated text string.`,
+
+  CRITIQUE_SYSTEM: `You are a translation quality assurance specialist.
+Compare the "Original Text" and the "Translation Draft", and list improvement points based on the following criteria.
+
+[Check Criteria]
+1. **Technical Terms**: Are technical terms or library names unnecessarily katakana-ized? (Keep them in English if that is more natural).
+2. **TTS Suitability**: Is the rhythm poor when heard via TTS, or are sentences too long causing unnatural pauses?
+3. **Accuracy & Naturalness**: Are there mistranslations? Has existing Japanese content been altered unnaturally?
+
+If there are no issues, output only "No issues".`,
+
+  REFINE_SYSTEM: `You are a professional editor.
+Create the **final translation** optimized for TTS based on the "Original Text", "Initial Translation", and "Critique".
+If the critique says "No issues", output the initial translation as is.
+Output ONLY the final Japanese text.`
 };
 
 // ==========================================
@@ -24,26 +49,17 @@ Output ONLY the translated Japanese text.
 (async () => {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // --- 引数解析 ---
   const args = process.argv.slice(2);
-  
-  // 修正箇所: --debug-dir または -d を検知するように変更
   const debugIndex = args.findIndex(arg => arg === '--debug-dir' || arg === '-d');
   let debugDir = null;
   
   if (debugIndex !== -1 && args[debugIndex + 1]) {
     debugDir = args[debugIndex + 1];
-    // 引数リストからフラグとパスを除去（残りをテキスト入力とみなすため）
     args.splice(debugIndex, 2);
   }
 
-  // --- 入力テキストの取得 (Stdin or Args) ---
   let inputText = args.join(' ').trim();
-
-  // 引数がなければ標準入力を待つ
-  if (!inputText) {
-    inputText = await getStdin();
-  }
+  if (!inputText) inputText = await getStdin();
 
   if (!inputText) {
     console.error('Error: No input text provided.');
@@ -51,45 +67,76 @@ Output ONLY the translated Japanese text.
   }
 
   try {
-    // --- デバッグ: ディレクトリ作成 ---
-    if (debugDir) {
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
-      }
-
-      // 1. 原文の保存
-      fs.writeFileSync(path.join(debugDir, '01_input_text.txt'), inputText);
-      // 2. システムプロンプトの保存
-      fs.writeFileSync(path.join(debugDir, '02_system_prompt.txt'), CONFIG.SYSTEM_PROMPT);
+    if (debugDir && !fs.existsSync(debugDir)) {
+      fs.mkdirSync(debugDir, { recursive: true });
     }
 
-    // --- API呼び出し ---
-    const completion = await openai.chat.completions.create({
+    // ==========================================
+    // Step 1: Draft (下訳)
+    // ==========================================
+    console.error('>> 1/3 Draft (下訳作成中)...'); // 進捗表示
+    
+    const draftCompletion = await openai.chat.completions.create({
       model: CONFIG.MODEL,
+      temperature: CONFIG.TEMPERATURE,
       messages: [
-        { role: 'system', content: CONFIG.SYSTEM_PROMPT },
+        { role: 'system', content: PROMPTS.DRAFT_SYSTEM },
         { role: 'user', content: inputText },
       ],
     });
+    const draftText = draftCompletion.choices[0].message.content.trim();
 
-    const translatedText = completion.choices[0].message.content.trim();
+    // ==========================================
+    // Step 2: Critique (査読)
+    // ==========================================
+    console.error('>> 2/3 Critique (AI査読中)...');
 
-    // --- デバッグ: 結果保存 ---
-    if (debugDir) {
-      // 3. 翻訳結果の保存
-      fs.writeFileSync(path.join(debugDir, '03_output_text.txt'), translatedText);
-      
-      // 4. メタデータの保存
-      const metaData = {
-        model: completion.model,
-        usage: completion.usage,
-        created: new Date().toISOString()
-      };
-      fs.writeFileSync(path.join(debugDir, '04_meta.json'), JSON.stringify(metaData, null, 2));
+    const critiqueCompletion = await openai.chat.completions.create({
+      model: CONFIG.MODEL,
+      temperature: CONFIG.TEMPERATURE,
+      messages: [
+        { role: 'system', content: PROMPTS.CRITIQUE_SYSTEM },
+        { role: 'user', content: `Original Text: ${inputText}\n\nTranslation Draft: ${draftText}` },
+      ],
+    });
+    const critiqueText = critiqueCompletion.choices[0].message.content.trim();
+
+    // ★★★ 変更点: 査読内容をコンソールに見やすく表示 ★★★
+    console.error('\n--- [AI査読レポート] -----------------');
+    console.error(critiqueText);
+    console.error('--------------------------------------\n');
+
+    // ==========================================
+    // Step 3: Refine (推敲)
+    // ==========================================
+    let finalText = "";
+
+    if (critiqueText.includes("No issues") || critiqueText.includes("問題なし")) {
+      console.error('>> 3/3 Refine: 指摘がないためスキップしました。');
+      finalText = draftText;
+    } else {
+      console.error('>> 3/3 Refine (推敲による修正中)...');
+      const refineCompletion = await openai.chat.completions.create({
+        model: CONFIG.MODEL,
+        temperature: CONFIG.TEMPERATURE,
+        messages: [
+          { role: 'system', content: PROMPTS.REFINE_SYSTEM },
+          { role: 'user', content: `Original Text: ${inputText}\nInitial Translation: ${draftText}\nCritique: ${critiqueText}` },
+        ],
+      });
+      finalText = refineCompletion.choices[0].message.content.trim();
     }
 
-    // 標準出力へ (次のパイプへ渡すため)
-    console.log(translatedText);
+    // --- デバッグ保存 ---
+    if (debugDir) {
+      fs.writeFileSync(path.join(debugDir, '01_input.txt'), inputText);
+      fs.writeFileSync(path.join(debugDir, '02_draft.txt'), draftText);
+      fs.writeFileSync(path.join(debugDir, '03_critique.txt'), critiqueText);
+      fs.writeFileSync(path.join(debugDir, '04_final.txt'), finalText);
+    }
+
+    // --- 最終出力 (標準出力) ---
+    console.log(finalText);
 
   } catch (error) {
     console.error('Translation Error:', error.message);
@@ -97,17 +144,12 @@ Output ONLY the translated Japanese text.
   }
 })();
 
-// 標準入力を読み取るヘルパー関数
+// ヘルパー関数
 function getStdin() {
   return new Promise((resolve) => {
     let data = '';
     const stdin = process.stdin;
-    
-    if (stdin.isTTY) {
-      resolve('');
-      return;
-    }
-
+    if (stdin.isTTY) { resolve(''); return; }
     stdin.setEncoding('utf8');
     stdin.on('data', chunk => data += chunk);
     stdin.on('end', () => resolve(data.trim()));
