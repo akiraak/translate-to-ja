@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 
+// dotenvのログが標準出力(output.txt)に混ざらないように、一時的にconsole.logを無効化
+const originalLog = console.log;
+console.log = () => {}; 
 require('dotenv').config();
+console.log = originalLog; // 元に戻す
+
+const { Command } = require('commander');
 const { OpenAI } = require('openai');
 const fs = require('fs');
 const path = require('path');
@@ -9,8 +15,7 @@ const path = require('path');
 // 設定 (Configuration)
 // ==========================================
 const CONFIG = {
-  MODEL: 'gpt-4o', 
-  TEMPERATURE: 0,
+  MODEL: 'gpt-5',
 };
 
 // ==========================================
@@ -44,107 +49,116 @@ Output ONLY the final Japanese text.`
 };
 
 // ==========================================
-// メイン処理
+// CLI定義 & メイン処理
 // ==========================================
-(async () => {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const program = new Command();
 
-  const args = process.argv.slice(2);
-  const debugIndex = args.findIndex(arg => arg === '--debug-dir' || arg === '-d');
-  let debugDir = null;
-  
-  if (debugIndex !== -1 && args[debugIndex + 1]) {
-    debugDir = args[debugIndex + 1];
-    args.splice(debugIndex, 2);
-  }
+program
+  .name('translate-cli')
+  .description('Translate text to Japanese with TTS optimization using OpenAI (Draft -> Critique -> Refine)')
+  .version('1.0.0')
+  .argument('[text...]', 'Input text to translate (can be omitted if using stdin)')
+  .option('-d, --debug-dir <path>', 'Directory to save debug files (draft/critique logs)')
+  .action(async (textArgs, options) => {
+    // OpenAI インスタンス作成
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  let inputText = args.join(' ').trim();
-  if (!inputText) inputText = await getStdin();
-
-  if (!inputText) {
-    console.error('Error: No input text provided.');
-    process.exit(1);
-  }
-
-  try {
-    if (debugDir && !fs.existsSync(debugDir)) {
-      fs.mkdirSync(debugDir, { recursive: true });
+    // 引数からのテキスト結合 (例: node script.js Hello World -> "Hello World")
+    let inputText = textArgs.join(' ').trim();
+    
+    // 引数がない場合は標準入力を待つ
+    if (!inputText) {
+      inputText = await getStdin();
     }
 
-    // ==========================================
-    // Step 1: Draft (下訳)
-    // ==========================================
-    console.error('>> 1/3 Draft (下訳作成中)...'); // 進捗表示
-    
-    const draftCompletion = await openai.chat.completions.create({
-      model: CONFIG.MODEL,
-      temperature: CONFIG.TEMPERATURE,
-      messages: [
-        { role: 'system', content: PROMPTS.DRAFT_SYSTEM },
-        { role: 'user', content: inputText },
-      ],
-    });
-    const draftText = draftCompletion.choices[0].message.content.trim();
+    if (!inputText) {
+      console.error('Error: No input text provided. Pass text as argument or via stdin.');
+      process.exit(1);
+    }
 
-    // ==========================================
-    // Step 2: Critique (査読)
-    // ==========================================
-    console.error('>> 2/3 Critique (AI査読中)...');
+    const debugDir = options.debugDir;
 
-    const critiqueCompletion = await openai.chat.completions.create({
-      model: CONFIG.MODEL,
-      temperature: CONFIG.TEMPERATURE,
-      messages: [
-        { role: 'system', content: PROMPTS.CRITIQUE_SYSTEM },
-        { role: 'user', content: `Original Text: ${inputText}\n\nTranslation Draft: ${draftText}` },
-      ],
-    });
-    const critiqueText = critiqueCompletion.choices[0].message.content.trim();
+    try {
+      if (debugDir && !fs.existsSync(debugDir)) {
+        fs.mkdirSync(debugDir, { recursive: true });
+      }
 
-    // ★★★ 変更点: 査読内容をコンソールに見やすく表示 ★★★
-    console.error('\n--- [AI査読レポート] -----------------');
-    console.error(critiqueText);
-    console.error('--------------------------------------\n');
-
-    // ==========================================
-    // Step 3: Refine (推敲)
-    // ==========================================
-    let finalText = "";
-
-    if (critiqueText.includes("No issues") || critiqueText.includes("問題なし")) {
-      console.error('>> 3/3 Refine: 指摘がないためスキップしました。');
-      finalText = draftText;
-    } else {
-      console.error('>> 3/3 Refine (推敲による修正中)...');
-      const refineCompletion = await openai.chat.completions.create({
+      // ==========================================
+      // Step 1: Draft (下訳)
+      // ==========================================
+      console.error('>> 1/3 Draft (下訳作成中)...'); 
+      
+      const draftCompletion = await openai.chat.completions.create({
         model: CONFIG.MODEL,
-        temperature: CONFIG.TEMPERATURE,
         messages: [
-          { role: 'system', content: PROMPTS.REFINE_SYSTEM },
-          { role: 'user', content: `Original Text: ${inputText}\nInitial Translation: ${draftText}\nCritique: ${critiqueText}` },
+          { role: 'system', content: PROMPTS.DRAFT_SYSTEM },
+          { role: 'user', content: inputText },
         ],
       });
-      finalText = refineCompletion.choices[0].message.content.trim();
+      const draftText = draftCompletion.choices[0].message.content.trim();
+
+      // ==========================================
+      // Step 2: Critique (査読)
+      // ==========================================
+      console.error('>> 2/3 Critique (AI査読中)...');
+
+      const critiqueCompletion = await openai.chat.completions.create({
+        model: CONFIG.MODEL,
+        messages: [
+          { role: 'system', content: PROMPTS.CRITIQUE_SYSTEM },
+          { role: 'user', content: `Original Text: ${inputText}\n\nTranslation Draft: ${draftText}` },
+        ],
+      });
+      const critiqueText = critiqueCompletion.choices[0].message.content.trim();
+
+      // 査読レポート表示
+      console.error('\n--- [AI査読レポート] -----------------');
+      console.error(critiqueText);
+      console.error('--------------------------------------\n');
+
+      // ==========================================
+      // Step 3: Refine (推敲)
+      // ==========================================
+      let finalText = "";
+
+      if (critiqueText.includes("No issues") || critiqueText.includes("問題なし")) {
+        console.error('>> 3/3 Refine: 指摘がないためスキップしました。');
+        finalText = draftText;
+      } else {
+        console.error('>> 3/3 Refine (推敲による修正中)...');
+        const refineCompletion = await openai.chat.completions.create({
+          model: CONFIG.MODEL,
+          messages: [
+            { role: 'system', content: PROMPTS.REFINE_SYSTEM },
+            { role: 'user', content: `Original Text: ${inputText}\nInitial Translation: ${draftText}\nCritique: ${critiqueText}` },
+          ],
+        });
+        finalText = refineCompletion.choices[0].message.content.trim();
+      }
+
+      // --- デバッグ保存 ---
+      if (debugDir) {
+        fs.writeFileSync(path.join(debugDir, '01_input.txt'), inputText);
+        fs.writeFileSync(path.join(debugDir, '02_draft.txt'), draftText);
+        fs.writeFileSync(path.join(debugDir, '03_critique.txt'), critiqueText);
+        fs.writeFileSync(path.join(debugDir, '04_final.txt'), finalText);
+      }
+
+      // --- 最終出力 (標準出力) ---
+      console.log(finalText);
+
+    } catch (error) {
+      console.error('Translation Error:', error.message);
+      process.exit(1);
     }
+  });
 
-    // --- デバッグ保存 ---
-    if (debugDir) {
-      fs.writeFileSync(path.join(debugDir, '01_input.txt'), inputText);
-      fs.writeFileSync(path.join(debugDir, '02_draft.txt'), draftText);
-      fs.writeFileSync(path.join(debugDir, '03_critique.txt'), critiqueText);
-      fs.writeFileSync(path.join(debugDir, '04_final.txt'), finalText);
-    }
+// 引数解析の実行
+program.parse(process.argv);
 
-    // --- 最終出力 (標準出力) ---
-    console.log(finalText);
-
-  } catch (error) {
-    console.error('Translation Error:', error.message);
-    process.exit(1);
-  }
-})();
-
+// ==========================================
 // ヘルパー関数
+// ==========================================
 function getStdin() {
   return new Promise((resolve) => {
     let data = '';
