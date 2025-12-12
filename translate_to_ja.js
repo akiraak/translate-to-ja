@@ -1,165 +1,189 @@
 #!/usr/bin/env node
 
-// dotenvのログが標準出力(output.txt)に混ざらないように、一時的にconsole.logを無効化
+// ログ抑制ハック
 const originalLog = console.log;
 console.log = () => {}; 
 require('dotenv').config();
-console.log = originalLog; // 元に戻す
+console.log = originalLog;
 
 const { Command } = require('commander');
-const { OpenAI } = require('openai');
 const fs = require('fs');
 const path = require('path');
+
+// LangChain Imports
+const { ChatOpenAI } = require('@langchain/openai');
+const { ChatPromptTemplate } = require('@langchain/core/prompts');
+const { StringOutputParser } = require('@langchain/core/output_parsers');
+const { RecursiveCharacterTextSplitter } = require('@langchain/textsplitters');
 
 // ==========================================
 // 設定 (Configuration)
 // ==========================================
 const CONFIG = {
-  MODEL: 'gpt-5',
+  MODEL_NAME: 'gpt-5',
+  CHUNK_SIZE: 1000,
+  CHUNK_OVERLAP: 0, // 翻訳重複を避けるため0推奨
+  CONCURRENCY_LIMIT: 4,
 };
 
 // ==========================================
-// プロンプト定義
+// プロンプト定義 (Template)
 // ==========================================
-const PROMPTS = {
-  DRAFT_SYSTEM: `You are a professional technical translator.
+const SYSTEM_PROMPTS = {
+  DRAFT: `You are a professional technical translator.
 Translate the input text into Japanese strictly adhering to the following [Constraints].
 
 [Constraints]
 1. **Output Language**: Always output in Japanese.
-2. **Keep English Terms**: Do not katakana-ize product names, codes, specific proper nouns, or technical terms (e.g., 'iPhone', 'Python', 'API') if the original English spelling is more natural for pronunciation or recognition. Keep them in English.
-3. **Maintain Existing Japanese**: If parts of the input text are already in natural Japanese, keep them exactly as they are.
-4. **TTS Optimization**: Translate for Text-To-Speech (TTS) purposes. Ensure the Japanese is audibly easy to understand with a natural rhythm. Break up sentences that are too long.
-5. **No Superfluous Text**: Do not include explanations, notes, or conversational fillers. Output ONLY the translated text string.`,
+2. **Keep English Terms**: Do not katakana-ize product names, codes, specific proper nouns, or technical terms.
+3. **Maintain Existing Japanese**: Keep existing natural Japanese as is.
+4. **TTS Optimization**: Translate for Text-To-Speech (TTS). Ensure natural rhythm and audible clarity.
+5. **No Superfluous Text**: Output ONLY the translated text string.`,
 
-  CRITIQUE_SYSTEM: `You are a translation quality assurance specialist.
-Compare the "Original Text" and the "Translation Draft", and list improvement points based on the following criteria.
-
-[Check Criteria]
-1. **Technical Terms**: Are technical terms or library names unnecessarily katakana-ized? (Keep them in English if that is more natural).
-2. **TTS Suitability**: Is the rhythm poor when heard via TTS, or are sentences too long causing unnatural pauses?
-3. **Accuracy & Naturalness**: Are there mistranslations? Has existing Japanese content been altered unnaturally?
+  CRITIQUE: `You are a translation quality assurance specialist.
+Compare the "Original Text" and the "Translation Draft", and list improvement points based on:
+1. **Technical Terms**: Are terms unnecessarily katakana-ized?
+2. **TTS Suitability**: Is the rhythm poor or sentences too long?
+3. **Accuracy & Naturalness**: Any mistranslations?
 
 If there are no issues, output only "No issues".`,
 
-  REFINE_SYSTEM: `You are a professional editor.
-Create the **final translation** optimized for TTS based on the "Original Text", "Initial Translation", and "Critique".
+  REFINE: `You are a professional editor.
+Create the **final translation** optimized for TTS based on the input.
 If the critique says "No issues", output the initial translation as is.
 Output ONLY the final Japanese text.`
 };
 
 // ==========================================
-// CLI定義 & メイン処理
+// メイン処理
 // ==========================================
 const program = new Command();
 
 program
-  .name('translate-cli')
-  .description('Translate text to Japanese with TTS optimization using OpenAI (Draft -> Critique -> Refine)')
-  .version('1.0.0')
-  .argument('[text...]', 'Input text to translate (can be omitted if using stdin)')
-  .option('-d, --debug-dir <path>', 'Directory to save debug files (draft/critique logs)')
+  .name('translate-cli-lc')
+  .description('Translate text using LangChain (Split -> Draft -> Critique -> Refine)')
+  .version('2.0.0')
+  .argument('[text...]', 'Input text')
+  .option('-d, --debug-dir <path>', 'Directory to save debug files')
   .action(async (textArgs, options) => {
-    // OpenAI インスタンス作成
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    // 引数からのテキスト結合 (例: node script.js Hello World -> "Hello World")
+    // 入力処理
     let inputText = textArgs.join(' ').trim();
-    
-    // 引数がない場合は標準入力を待つ
+    if (!inputText) inputText = await getStdin();
     if (!inputText) {
-      inputText = await getStdin();
-    }
-
-    if (!inputText) {
-      console.error('Error: No input text provided. Pass text as argument or via stdin.');
+      console.error('Error: No input text provided.');
       process.exit(1);
     }
 
     const debugDir = options.debugDir;
+    if (debugDir && !fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
 
     try {
-      if (debugDir && !fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
-      }
+      // 1. モデルとパーサーの初期化
+      const model = new ChatOpenAI({ 
+        modelName: CONFIG.MODEL_NAME, 
+        apiKey: process.env.OPENAI_API_KEY
+      });
+      const parser = new StringOutputParser();
 
-      // ==========================================
-      // Step 1: Draft (下訳)
-      // ==========================================
-      console.error('>> 1/3 Draft (下訳作成中)...'); 
+      // 2. テキスト分割
+      const splitter = new RecursiveCharacterTextSplitter({
+        chunkSize: CONFIG.CHUNK_SIZE,
+        chunkOverlap: CONFIG.CHUNK_OVERLAP,
+        // 以下の順序で分割を試みます（上にあるものほど優先）
+        separators: [
+            "\n\n",  // 1. 段落（最も強く分割したい）
+            "\n",    // 2. 改行
+            ". ",    // 3. 英語の文末（". "とスペース付きにすると "Node.js" 等の誤分割を防げます）
+            "? ", 
+            "! ",
+            ".", "?", "!", // 4. スペースなしの英語文末（念のため）
+            "。", "！", "？", // 5. 日本語の文末
+            " ",     // 6. 単語の区切り（英語では超重要。単語の途中で切れるのを防ぐ）
+            ""       // 7. 最終手段（文字単位）
+        ], 
+      });
       
-      const draftCompletion = await openai.chat.completions.create({
-        model: CONFIG.MODEL,
-        messages: [
-          { role: 'system', content: PROMPTS.DRAFT_SYSTEM },
-          { role: 'user', content: inputText },
-        ],
+      const docs = await splitter.createDocuments([inputText]);
+      const chunks = docs.map(d => d.pageContent);
+
+      console.error(`>> Total Length: ${inputText.length} chars. Split into ${chunks.length} chunks.`);
+
+      // 3. 各Chainの定義 (LCEL)
+      const draftChain = ChatPromptTemplate.fromMessages([
+        ["system", SYSTEM_PROMPTS.DRAFT],
+        ["human", "{text}"]
+      ]).pipe(model).pipe(parser);
+
+      const critiqueChain = ChatPromptTemplate.fromMessages([
+        ["system", SYSTEM_PROMPTS.CRITIQUE],
+        ["human", "Original Text:\n{original}\n\nTranslation Draft:\n{draft}"]
+      ]).pipe(model).pipe(parser);
+
+      const refineChain = ChatPromptTemplate.fromMessages([
+        ["system", SYSTEM_PROMPTS.REFINE],
+        ["human", "Original Text:\n{original}\nInitial Translation:\n{draft}\nCritique:\n{critique}"]
+      ]).pipe(model).pipe(parser);
+
+      // 4. 並列実行処理 (各チャンクごとにChainを実行)
+      const results = await runWithConcurrency(chunks, CONFIG.CONCURRENCY_LIMIT, async (chunkText, index) => {
+        const prefix = `[Chunk ${index + 1}/${chunks.length}]`;
+        const log = (msg) => console.error(`${prefix} ${msg}`);
+        const debugPrefix = (index + 1).toString().padStart(3, '0');
+
+        // --- Step 1: Draft ---
+        log('Drafting...');
+        const draftText = await draftChain.invoke({ text: chunkText });
+
+        // --- Step 2: Critique ---
+        log('Critiquing...');
+        const critiqueText = await critiqueChain.invoke({ original: chunkText, draft: draftText });
+
+        // --- Step 3: Refine ---
+        let finalText = "";
+        if (critiqueText.toLowerCase().includes("no issues") || critiqueText.includes("問題なし")) {
+          log('Refine skipped (No issues).');
+          finalText = draftText;
+        } else {
+          log('Refining...');
+          finalText = await refineChain.invoke({ 
+            original: chunkText, 
+            draft: draftText, 
+            critique: critiqueText 
+          });
+        }
+
+        // デバッグ保存
+        if (debugDir) {
+          fs.writeFileSync(path.join(debugDir, `${debugPrefix}_01_input.txt`), chunkText);
+          fs.writeFileSync(path.join(debugDir, `${debugPrefix}_02_draft.txt`), draftText);
+          fs.writeFileSync(path.join(debugDir, `${debugPrefix}_03_critique.txt`), critiqueText);
+          fs.writeFileSync(path.join(debugDir, `${debugPrefix}_04_final.txt`), finalText);
+        }
+
+        return finalText;
       });
-      const draftText = draftCompletion.choices[0].message.content.trim();
 
-      // ==========================================
-      // Step 2: Critique (査読)
-      // ==========================================
-      console.error('>> 2/3 Critique (AI査読中)...');
+      // 5. 結合して出力
+      const finalOutput = results.join('\n\n');
+      console.log(finalOutput);
 
-      const critiqueCompletion = await openai.chat.completions.create({
-        model: CONFIG.MODEL,
-        messages: [
-          { role: 'system', content: PROMPTS.CRITIQUE_SYSTEM },
-          { role: 'user', content: `Original Text: ${inputText}\n\nTranslation Draft: ${draftText}` },
-        ],
-      });
-      const critiqueText = critiqueCompletion.choices[0].message.content.trim();
-
-      // 査読レポート表示
-      console.error('\n--- [AI査読レポート] -----------------');
-      console.error(critiqueText);
-      console.error('--------------------------------------\n');
-
-      // ==========================================
-      // Step 3: Refine (推敲)
-      // ==========================================
-      let finalText = "";
-
-      if (critiqueText.includes("No issues") || critiqueText.includes("問題なし")) {
-        console.error('>> 3/3 Refine: 指摘がないためスキップしました。');
-        finalText = draftText;
-      } else {
-        console.error('>> 3/3 Refine (推敲による修正中)...');
-        const refineCompletion = await openai.chat.completions.create({
-          model: CONFIG.MODEL,
-          messages: [
-            { role: 'system', content: PROMPTS.REFINE_SYSTEM },
-            { role: 'user', content: `Original Text: ${inputText}\nInitial Translation: ${draftText}\nCritique: ${critiqueText}` },
-          ],
-        });
-        finalText = refineCompletion.choices[0].message.content.trim();
-      }
-
-      // --- デバッグ保存 ---
       if (debugDir) {
-        fs.writeFileSync(path.join(debugDir, '01_input.txt'), inputText);
-        fs.writeFileSync(path.join(debugDir, '02_draft.txt'), draftText);
-        fs.writeFileSync(path.join(debugDir, '03_critique.txt'), critiqueText);
-        fs.writeFileSync(path.join(debugDir, '04_final.txt'), finalText);
+        fs.writeFileSync(path.join(debugDir, 'full_output.txt'), finalOutput);
       }
-
-      // --- 最終出力 (標準出力) ---
-      console.log(finalText);
 
     } catch (error) {
-      console.error('Translation Error:', error.message);
+      console.error('Fatal Error:', error);
       process.exit(1);
     }
   });
 
-// 引数解析の実行
 program.parse(process.argv);
 
 // ==========================================
-// ヘルパー関数
+// ユーティリティ
 // ==========================================
-function getStdin() {
+
+async function getStdin() {
   return new Promise((resolve) => {
     let data = '';
     const stdin = process.stdin;
@@ -169,4 +193,27 @@ function getStdin() {
     stdin.on('end', () => resolve(data.trim()));
     stdin.on('error', () => resolve(''));
   });
+}
+
+// 並列実行制御 (LangChainの.batch()は進行状況ログが出しにくいため、従来の制御方式を採用)
+async function runWithConcurrency(tasks, limit, asyncFn) {
+  const results = new Array(tasks.length);
+  const executing = [];
+  let index = 0;
+
+  const enqueue = async () => {
+    if (index === tasks.length) return;
+    const i = index++;
+    const p = asyncFn(tasks[i], i).then(res => { results[i] = res; });
+    executing.push(p);
+    p.then(() => executing.splice(executing.indexOf(p), 1));
+    if (executing.length >= limit) await Promise.race(executing);
+    await enqueue();
+  };
+
+  const workers = [];
+  for (let j = 0; j < limit && j < tasks.length; j++) workers.push(enqueue());
+  await Promise.all(workers);
+  await Promise.all(executing);
+  return results;
 }
